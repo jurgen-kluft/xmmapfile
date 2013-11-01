@@ -6,21 +6,28 @@
 #pragma once
 #endif
 
-#include "xbase\x_types.h"
-
 namespace xcore
 {
+	class MMFIO;
+
 	// Memory mapped to a file on disk
-	class xmmem
+	class xmmapfile
 	{
 	public:
-		void		open(const char* filename);
-		void		open(const char* filename, u32 memsize);
-		void		flush();
-		void		close();
+						xmmapfile();
+						~xmmapfile();
 
-		void*		memptr();
-		void		resize(u32 newsize);
+		void			open(const char* filename, bool readonly);
+		void			create(const char* filename, u64 filesize);
+		void			close();
+
+		bool			map(u64 offset, u32 size, void*&);
+		void			unmap(void*, u32 size);
+		void			flush(void*, u32 size);
+
+	private:
+		MMFIO*			imp;
+		u64				impmem[20];
 	};
 
 }
