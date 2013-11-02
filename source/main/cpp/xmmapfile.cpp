@@ -45,10 +45,11 @@ namespace xcore
 	{
 	public:
 		xbyte			m_cRefCount;
+		bool			m_bReadonly;
 		HANDLE			m_hFileMapping;
 		xbyte*			m_pbFile;
 		u64				m_dwBytesInView;
-		u64				mFileSize;
+		u32				mFileSize;
 		u64				m_nViewBegin;//from beginning of file
 		u64				m_nCurPos;//from beginning of file
 		HANDLE			m_hFile;
@@ -56,30 +57,22 @@ namespace xcore
 		LONG			m_lExtendOnWriteLength;
 		u32				m_dwflagsFileMapping;
 		u32				m_dwflagsView;
-		bool			m_bFileExtended;
 		char const*		m_strErrMsg;
 
 		bool			_open(const char* strfile, bool readonly);
+		bool			_create(const char* strfile, u64 filesize);
 		void			_flush(void* p, u64 size);
-		bool			_checkFileExtended();
 		bool			_seek(u64 lOffset);
 		void			_close();
+
+		bool			_map(u64 offset, u32 size, void*& mem);
+		void			_unmap(void*, u32 size);
 
 	public:
 						MMFIO();
 						~MMFIO();
 
-		/* Construction */
-		bool			OpenReadOnly(const char* strfile);
-		bool			OpenReadWrite(const char* strfile);
-		bool			Close();
-
-		/* I/O */
-		u64				Read(void* pBuf, u64 nCount);
-		u64				Write(void* pBuf, u64 nCount);
-
 		/* Position */
-		bool			Seek(u64 lOffset);
 		u64				GetPosition();
 
 		/* Length */
@@ -118,19 +111,23 @@ namespace xcore
 		m_dwAllocGranularity = sinf.dwAllocationGranularity;
 		m_lExtendOnWriteLength = m_dwAllocGranularity;
 
+		m_bReadonly = true;
 		m_dwBytesInView = m_dwAllocGranularity;
 		m_nCurPos = 0;
 		m_nViewBegin = 0;
 		m_pbFile = 0;
 		m_hFileMapping = INVALID_HANDLE_VALUE;
 		m_cRefCount = 0;
-		m_bFileExtended = false;
 	}
 
 	void MMFIO::_close()
 	{
-		_checkFileExtended();
+		if (m_cRefCount == 0)
+			return;
 
+		m_cRefCount--;
+
+		/*
 		if(m_pbFile)
 		{
 			//unmap view 
@@ -138,6 +135,7 @@ namespace xcore
 			UnmapViewOfFile(m_pbFile);
 			m_pbFile = NULL;
 		}
+		*/
 
 		if(m_hFileMapping)
 		{
@@ -179,6 +177,7 @@ namespace xcore
 
 		// Open the data file.
 		u32 dwflags;
+		m_bReadonly = readonly;
 		dwflags = (readonly) ? GENERIC_READ : GENERIC_READ | GENERIC_WRITE;
 		m_hFile = CreateFile(strfile, dwflags, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
 
@@ -216,50 +215,114 @@ namespace xcore
 			return false;
 		}
 
-		if (m_dwBytesInView > mFileSize)
-			m_dwBytesInView = mFileSize;
+		m_nCurPos = 0;
+		m_nViewBegin = 0;
 
-		m_dwflagsView = FILE_MAP_ALL_ACCESS;
-		m_pbFile = (xbyte*)MapViewOfFile(m_hFileMapping, m_dwflagsView, 0, 0, (SIZE_T)m_dwBytesInView);
+		return true;
+	}
 
-		if (NULL == m_pbFile)
+
+	bool MMFIO::_create(const char* strfile, u64 filesize)
+	{
+#ifdef _DEBUG
+		ASSERT(m_cRefCount == 0);
+#endif
+
+		if(m_cRefCount!=0)
 		{
-			CloseHandle(m_hFileMapping);
-			m_strErrMsg = MMF_ERR_MAPVIEWOFFILE;
+			m_strErrMsg = MMF_ERR_WRONG_OPEN;
+			return false;
+		}
+
+		m_cRefCount++;
+
+		// Note:
+		// One might think it's a good idea to pass in FILE_FLAG_RANDOM_ACCESS.
+		// It turns out that it isn't. That flag will break your operating system:
+		//   http://support.microsoft.com/kb/2549369
+
+		// Open the data file.
+		m_bReadonly = false;
+		u32 dwflags = GENERIC_READ | GENERIC_WRITE;
+		m_hFile = CreateFile(strfile, dwflags, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+
+		SetLength(filesize);
+
+		HANDLE hFile=m_hFile;
+
+		if (INVALID_HANDLE_VALUE == hFile)
+		{
+			m_strErrMsg = MMF_ERR_OPEN_FILE;
+			m_cRefCount = 0;
+			return false;
+		}
+
+		unsigned long dwFileSizeHigh;
+		mFileSize = GetFileSize(hFile, &dwFileSizeHigh);
+		mFileSize += (((s64) dwFileSizeHigh) << 32);
+
+		if (mFileSize == 0)
+		{
+			CloseHandle(hFile);
+			m_strErrMsg = MMF_ERR_ZERO_BYTE_FILE;
+			m_cRefCount = 0;
+			return false;
+		}
+
+		// Create the file-mapping object.
+		m_dwflagsFileMapping = PAGE_READWRITE;
+		m_hFileMapping = CreateFileMapping(m_hFile, NULL, m_dwflagsFileMapping, 0, 0, 0);
+
+		if (NULL == m_hFileMapping)
+		{
+			if(INVALID_HANDLE_VALUE == m_hFile)
+				CloseHandle(m_hFile);
+			m_strErrMsg = MMF_ERR_CREATEFILEMAPPING;
 			m_cRefCount = 0;
 			return false;
 		}
 
 		m_nCurPos = 0;
 		m_nViewBegin = 0;
-		m_bFileExtended = false;
 
 		return true;
 	}
 
-	bool MMFIO::OpenReadOnly(const char* strfile)
+	bool MMFIO::_map(u64 offset, u32 size, void*& mem)
 	{
-		return _open(strfile, true);
-	}
+		if (m_cRefCount==0)
+			return false;
 
-	bool MMFIO::OpenReadWrite(const char* strfile)
-	{
-		return _open(strfile, false);
-	}
+		if (offset > mFileSize)
+			return false;
 
+		if ((offset + size) > mFileSize)
+			size = mFileSize - (u32)offset;
 
-	bool MMFIO::Close()
-	{
-	#ifdef _DEBUG
-		ASSERT(m_cRefCount == 1);
-	#endif
+		m_dwflagsView = m_bReadonly ? FILE_MAP_READ : FILE_MAP_ALL_ACCESS;
+		mem = MapViewOfFile(m_hFileMapping, m_dwflagsView, 0, 0, (SIZE_T)size);
 
-		m_cRefCount--;
-		_close();
+		if (NULL == mem)
+		{
+			DWORD lerr = GetLastError();
+
+			CloseHandle(m_hFileMapping);
+			m_strErrMsg = MMF_ERR_MAPVIEWOFFILE;
+			m_cRefCount = 0;
+			return false;
+		}
+
 		return true;
 	}
 
+	void MMFIO::_unmap(void* mem, u32 size)
+	{
+		FlushViewOfFile(mem, size);
+		UnmapViewOfFile(mem);
+	}
+	
 
+	/*
 	u64 MMFIO::Read(void* pBuf, u64 nCountIn)
 	{
 		if(nCountIn ==0)
@@ -330,6 +393,7 @@ namespace xcore
 
 		return nCount;
 	}
+	*/
 
 	bool MMFIO::SetLength(const u64& nLength)
 	{
@@ -353,7 +417,7 @@ namespace xcore
 			return false;
 		}
 
-		mFileSize = nLength;
+		mFileSize = (u32)nLength;
 
 		//call CreateFileMapping 
 		m_hFileMapping = CreateFileMapping(m_hFile, NULL, m_dwflagsFileMapping, 0, 0, _T("SMP"));
@@ -364,6 +428,7 @@ namespace xcore
 		return true;
 	}
 
+	/*
 	u64 MMFIO::Write(void* pBuf, u64 nCount)
 	{
 		if(nCount == 0)
@@ -411,6 +476,7 @@ namespace xcore
 
 		return nCount;
 	}
+	*/
 
 	void MMFIO::_flush(void* p, u64 size)
 	{
@@ -421,12 +487,14 @@ namespace xcore
 		}
 	}
 
+	/*
 	bool MMFIO::Seek(u64 lOffset)
 	{
 		_checkFileExtended();
 		bool bRet = _seek(lOffset);
 		return bRet;
 	}
+	*/
 
 	bool MMFIO::_seek(u64 lOffset)
 	{
@@ -465,7 +533,6 @@ namespace xcore
 
 	u64 MMFIO::GetLength()
 	{
-		_checkFileExtended();
 		return mFileSize;
 	}
 
@@ -474,97 +541,51 @@ namespace xcore
 		return m_nCurPos;
 	}
 
-	/*
-	If file is extended in Write function then this must be called to re-adjust
-	the file to its actual length before Seek or Read or any such function.
-	*/
-	bool MMFIO::_checkFileExtended()
-	{
-		bool bRet = true;
-		if(m_bFileExtended)
-		{
-			//remove extra bytes
-			bRet = SetLength(m_nCurPos);
-		}
-		m_bFileExtended = false;
-		return bRet;
-	}
-
 	#undef new 
 
-	xmmemro::xmmemro()
+	xmmapfile::xmmapfile()
 		: imp(0)
 	{
 		void* p = impmem;
 		imp = new (p) MMFIO();
 	}
 
-	xmmemro::~xmmemro()
+	xmmapfile::~xmmapfile()
 	{
 		imp->~MMFIO();
 	}
 
-	void			xmmemro::open(const char* filename)
+	void			xmmapfile::open(const char* filename, bool readonly)
 	{
-		imp->OpenReadWrite(filename);
+		imp->_open(filename, readonly);
 	}
 
-	void			xmmemro::open(const char* filename, u64 memsize)
+	void			xmmapfile::create(const char* filename, u64 memsize)
 	{
-		imp->OpenReadWrite(filename);
+		imp->_create(filename, memsize);
 		imp->SetLength(memsize);
 	}
 
-	void			xmmemro::close()
+	void			xmmapfile::close()
 	{
-		imp->Close();
+		imp->_close();
 	}
 
-	void const*		xmmemro::mem(u64& size) const
+	bool			xmmapfile::map(u64 offset, u32 size, void*& p)
 	{
-		size = imp->m_dwBytesInView;
-		return imp->m_pbFile;
+		return imp->_map(offset, size, p);
 	}
 
-
-	xmmemrw::xmmemrw()
-		: imp(0)
+	void			xmmapfile::unmap(void* p, u32 size)
 	{
-		void* p = impmem;
-		imp = new (p) MMFIO();
+		imp->_unmap(p, size);
 	}
 
-	xmmemrw::~xmmemrw()
+	void			xmmapfile::flush(void* p, u32 size)
 	{
-		imp->~MMFIO();
+		imp->_flush(p, size);
 	}
 
-	void			xmmemrw::open(const char* filename)
-	{
-		imp->OpenReadWrite(filename);
-	}
-
-	void			xmmemrw::open(const char* filename, u64 memsize)
-	{
-		imp->OpenReadWrite(filename);
-		imp->SetLength(memsize);
-	}
-
-	void			xmmemrw::flush(void* base, u64 size)
-	{
-		imp->_flush(base, size);
-	}
-
-	void			xmmemrw::close()
-	{
-		imp->Close();
-	}
-
-	void*			xmmemrw::mem(u64& size)
-	{
-		size = imp->m_dwBytesInView;
-		return imp->m_pbFile;
-	}
 
 }
 
