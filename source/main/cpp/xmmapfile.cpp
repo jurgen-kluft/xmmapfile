@@ -300,7 +300,7 @@ namespace xcore
 			size = mFileSize - (u32)offset;
 
 		m_dwflagsView = m_bReadonly ? FILE_MAP_READ : FILE_MAP_ALL_ACCESS;
-		mem = MapViewOfFile(m_hFileMapping, m_dwflagsView, 0, 0, (SIZE_T)size);
+		mem = MapViewOfFile(m_hFileMapping, m_dwflagsView, (DWORD)(offset >> 32), (DWORD)offset, (SIZE_T)size);
 
 		if (NULL == mem)
 		{
